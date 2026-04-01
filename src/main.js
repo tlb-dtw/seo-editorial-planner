@@ -90,7 +90,7 @@ function buildHTML() {
                 <input type="password" id="semrushkey" placeholder="Votre clé SEMrush..." autocomplete="off">
                 <button class="btn btn-sm" onclick="toggleVis('semrushkey')">Afficher</button>
               </div>
-              <span class="field-hint">Intention & format SERP réels — <a href="https://www.semrush.com/api-analytics/" target="_blank" style="color:var(--accent)">semrush.com/api-analytics</a></span>
+              <span class="field-hint">Intention & format SERP réels — optionnel. Laisser vide pour utiliser Claude.</span>
             </div>
             <div class="field">
               <label>Base de données SEMrush</label>
@@ -104,7 +104,6 @@ function buildHTML() {
                 <option value="ca">ca — Canada</option>
                 <option value="au">au — Australia</option>
               </select>
-              <span class="field-hint">Laisser vide pour désactiver SEMrush — l'intention sera estimée par Claude</span>
             </div>
           </div>
         </div>
@@ -308,7 +307,9 @@ window.goStep = function(n) {
     if (!document.getElementById('apikey').value.trim()) {
       alert('Clé API Anthropic manquante.'); return;
     }
+    setStep(3);
     startAnalysis();
+    return;
   }
   setStep(n);
 };
@@ -318,10 +319,21 @@ window.toggleVis = function(id) {
   el.type = el.type === 'password' ? 'text' : 'password';
 };
 
+// ── SHOW RESULTS — appelé en fin d'analyse, toujours ─────────
+function showResults(pages) {
+  state.pages = pages;
+  state.filtered = [...pages];
+  setStep(4);
+  renderMetrics();
+  renderTable();
+}
+
 // ── ANALYSIS ─────────────────────────────────────────────────
 async function startAnalysis() {
+  // Abort controller séparé pour Claude uniquement
   state.abortController = new AbortController();
-  const { signal } = state.abortController;
+  const claudeSignal = state.abortController.signal;
+
   const apiKey = document.getElementById('apikey').value.trim();
   const semrushKey = document.getElementById('semrushkey').value.trim();
   const semrushDb = document.getElementById('semrushDb').value;
@@ -341,6 +353,8 @@ async function startAnalysis() {
     document.getElementById('progressPct').textContent = Math.round(pct)+'%';
   };
 
+  let pages = [];
+
   try {
     // ── 1. Nettoyage ──────────────────────────────────────────
     log(`▶ Démarrage — ${state.kpData.length} kw source · ${state.ahrefsData.length} positions Ahrefs`, 'accent');
@@ -358,38 +372,46 @@ async function startAnalysis() {
 
     let categorized = [];
     for (let b = 0; b < batches.length; b++) {
-      if (signal.aborted) { log('⚠ Annulé','err'); break; }
+      if (claudeSignal.aborted) { log('⚠ Analyse annulée par l\'utilisateur','err'); break; }
       setProgress(10 + (b/batches.length)*45, `Lot ${b+1}/${batches.length}...`);
       log(`→ Lot ${b+1}/${batches.length} · ${batches[b].length} kw`);
       try {
-        const res = await categorizeBatch(batches[b], lang, apiKey, signal);
+        const res = await categorizeBatch(batches[b], lang, apiKey, claudeSignal);
         categorized = categorized.concat(res);
         log(`  ✓ ${res.length} catégorisés`, 'ok');
       } catch(e) {
-        if (e.name === 'AbortError') break;
+        if (e.name === 'AbortError') { log('⚠ Annulé','err'); break; }
         log(`  ✗ ${e.message.substring(0,100)}`, 'err');
         categorized = categorized.concat(createFallbackBatch(batches[b]));
-        log(`  → Fallback appliqué`, 'info');
+        log(`  → Fallback appliqué (valeurs par défaut)`, 'info');
       }
-      if (b < batches.length-1) await sleep(350);
+      if (b < batches.length-1) await sleep(400);
+    }
+
+    if (!categorized.length) {
+      log('Aucun keyword catégorisé — vérifiez la clé API.', 'err');
+      return;
     }
 
     // ── 3. Clustering en pages ────────────────────────────────
     setProgress(58, 'Clustering keywords → pages...');
     log('Regroupement par URL Ahrefs + clustering sémantique GAP...', 'accent');
-    let pages = clusterIntoPages(categorized, ahrefsMap);
+    pages = clusterIntoPages(categorized, ahrefsMap);
     log(`✓ ${pages.length} pages identifiées`, 'ok');
 
-    // ── 4. Enrichissement SEMrush (optionnel) ─────────────────
-    if (semrushKey) {
+    // ── 4. Enrichissement SEMrush (signal indépendant de Claude) ──
+    if (semrushKey && pages.length > 0) {
       const mainKws = pages.map(p => p.mainKeyword).filter(Boolean);
       log(`SEMrush : enrichissement de ${mainKws.length} keywords principaux...`, 'accent');
       setProgress(62, 'SEMrush — intention & format SERP réels...');
 
       try {
+        // Nouveau AbortController pour SEMrush — indépendant de Claude
+        const semrushController = new AbortController();
         const semrushData = await enrichKeywordsWithSemrush(
-          mainKws, semrushDb, semrushKey, signal,
-          msg => { log(`  ${msg}`); }
+          mainKws, semrushDb, semrushKey,
+          semrushController.signal,
+          msg => log(`  ${msg}`)
         );
 
         let enriched = 0;
@@ -403,40 +425,43 @@ async function startAnalysis() {
         });
         log(`✓ ${enriched} pages enrichies via SEMrush`, 'ok');
       } catch(e) {
-        log(`⚠ SEMrush : ${e.message} — on continue avec les données Claude`, 'err');
+        // Erreur SEMrush non bloquante — on continue avec les données Claude
+        log(`⚠ SEMrush erreur : ${e.message.substring(0,80)} — données Claude conservées`, 'err');
       }
-    } else {
-      log('SEMrush désactivé — intention estimée par Claude', 'info');
+    } else if (!semrushKey) {
+      log('SEMrush non configuré — intention estimée par Claude', 'info');
     }
 
-    // ── 5. Finalisation ───────────────────────────────────────
-    setProgress(95, 'Finalisation...');
-    state.pages = pages;
-    state.filtered = [...pages];
-
+    // ── 5. Métriques finales ──────────────────────────────────
+    setProgress(98, 'Finalisation...');
     const gap = pages.filter(p => p.status === 'GAP').length;
     const ok = pages.filter(p => p.status === 'OK').length;
     const risk = pages.filter(p => p.status === 'RISK').length;
-    const totalIncr = pages.reduce((a,p) => a + p.trafficIncremental, 0);
+    const totalIncr = pages.reduce((a,p) => a + (p.trafficIncremental||0), 0);
 
-    setProgress(100, 'Terminé');
+    setProgress(100, 'Analyse terminée — chargement des résultats...');
     log('');
     log(`✓ ${pages.length} pages · GAP:${gap} OK:${ok} RISK:${risk}`, 'ok');
     log(`Gain trafic potentiel total : +${totalIncr.toLocaleString('fr-FR')} visites/mois`, 'accent');
-
-    setTimeout(() => {
-      ['s1','s2','s3'].forEach(id => document.getElementById(id).classList.add('done'));
-      setStep(4);
-      renderMetrics();
-      renderTable();
-    }, 600);
+    log('Passage aux résultats...', 'info');
 
   } catch(e) {
-    if (e.name !== 'AbortError') log(`Erreur fatale : ${e.message}`, 'err');
+    log(`Erreur inattendue : ${e.message}`, 'err');
+    log('Affichage des résultats partiels...', 'info');
+  } finally {
+    // ── TOUJOURS afficher les résultats, même en cas d'erreur ──
+    if (pages.length > 0) {
+      setTimeout(() => showResults(pages), 800);
+    } else {
+      setProgress(0, 'Analyse échouée — vérifiez les logs ci-dessus');
+    }
   }
 }
 
-window.abortAnalysis = () => state.abortController?.abort();
+window.abortAnalysis = () => {
+  state.abortController?.abort();
+  log('Analyse annulée — affichage des résultats partiels...', 'err');
+};
 
 // ── RENDER ───────────────────────────────────────────────────
 function renderMetrics() {
@@ -444,7 +469,7 @@ function renderMetrics() {
   const gap = p.filter(x => x.status==='GAP').length;
   const ok = p.filter(x => x.status==='OK').length;
   const risk = p.filter(x => x.status==='RISK').length;
-  const totalIncr = p.reduce((a,x) => a+x.trafficIncremental, 0);
+  const totalIncr = p.reduce((a,x) => a+(x.trafficIncremental||0), 0);
   const fmt = n => n >= 1000 ? (Math.round(n/100)/10)+'k' : n.toString();
 
   document.getElementById('metricsStrip').innerHTML = `
@@ -466,13 +491,13 @@ function renderTable() {
   const data = state.filtered.slice(0, 800);
   document.getElementById('resultsTbody').innerHTML = data.map(p => {
     const urlDisplay = p.url
-      ? `<span style="font-size:10px;color:var(--text-3)" title="${p.url}">${p.url.replace(/https?:\/\/[^/]+/,'').substring(0,35)||p.url.substring(0,35)}…</span>`
-      : `<span style="font-size:11px;color:var(--accent-dim)">${p.cluster||'—'}</span>`;
+      ? `<span style="font-size:10px;color:var(--text-3)" title="${p.url}">${p.url.replace(/https?:\/\/[^/]+/,'').substring(0,35)||p.url.substring(0,35)}</span>`
+      : `<span style="font-size:11px;color:var(--accent-dim)">${(p.cluster||'GAP').substring(0,30)}</span>`;
     const secKws = p.secondaryKeywords.slice(0,3).join(', ') + (p.secondaryKeywords.length > 3 ? ` +${p.secondaryKeywords.length-3}` : '');
     return `<tr>
       <td>${b(p.action, BA[p.action]||'badge-neutral')}</td>
       <td title="${p.url||p.cluster}">${urlDisplay}</td>
-      <td style="font-weight:500;color:var(--text)" title="${p.mainKeyword}">${p.mainKeyword||'—'}</td>
+      <td style="font-weight:500;color:var(--text)" title="${p.mainKeyword}">${(p.mainKeyword||'—').substring(0,30)}</td>
       <td style="font-size:11px;color:var(--text-3)" title="${p.secondaryKeywords.join(', ')}">${secKws||'—'}</td>
       <td style="color:var(--text);font-weight:500">${(p.mainVolume||0).toLocaleString('fr-FR')}</td>
       <td style="color:var(--text-3)">${p.mainPosition!=null?p.mainPosition:'—'}</td>
@@ -484,7 +509,6 @@ function renderTable() {
     </tr>`;
   }).join('');
 
-  // Sort indicators
   ['action','mainKeyword','mainVolume','mainPosition','kwPositionnedCount','trafficCurrent','trafficIncremental'].forEach(col => {
     const th = document.getElementById(`th-${col}`);
     if (!th) return;
@@ -525,6 +549,6 @@ window.applyFilters = function() {
 };
 
 window.exportResults = function() {
-  if (!state.pages.length) { alert('Aucun résultat.'); return; }
+  if (!state.pages.length) { alert('Aucun résultat à exporter.'); return; }
   exportPagesToCSV(state.pages);
 };
