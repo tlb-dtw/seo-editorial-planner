@@ -296,8 +296,8 @@ function setupUpload(num) {
 
 function processFile(text, num, filename) {
   try {
-    const expectedCols = num === 1 ? 2 : 4;
-    const { rows } = parseCSV(text, expectedCols);
+    const fileType = num === 1 ? 'kp' : 'ahrefs';
+    const { rows } = parseCSV(text, fileType);
 
     if (rows.length === 0) throw new Error('Aucune ligne valide. Vérifiez le format du fichier.');
 

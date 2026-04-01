@@ -1,11 +1,10 @@
 /**
  * Anthropic API client
- * Handles batched keyword categorization via Claude Haiku
+ * Appelle /api/claude (proxy Vercel serverless) pour éviter les erreurs CORS.
  */
 
-const API_URL = 'https://api.anthropic.com/v1/messages';
+const PROXY_URL = '/api/claude';
 const MODEL = 'claude-haiku-4-5-20251001';
-
 const LANG_LABELS = { fr: 'français', en: 'anglais', es: 'espagnol' };
 
 export async function categorizeBatch(batch, lang, apiKey, signal) {
@@ -23,22 +22,19 @@ Règles :
 - serp : format dominant attendu dans les résultats Google
 - paa : true si le keyword génère probablement des "People Also Ask"
 - trend : évolution estimée de la demande sur 12 mois
-- difficulty : score KD estimé 0-100 basé sur la concurrence
+- difficulty : score KD estimé 0-100 basé sur la concurrence sectorielle
 - title : titre d'article optimisé, naturel, pas de keyword stuffing
 - cluster : regroupement thématique pour le maillage interne
 
 Keywords :
 ${kwList}`;
 
-  const response = await fetch(API_URL, {
+  const response = await fetch(PROXY_URL, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
+    headers: { 'Content-Type': 'application/json' },
     signal,
     body: JSON.stringify({
+      apiKey,
       model: MODEL,
       max_tokens: 4096,
       messages: [{ role: 'user', content: prompt }],
@@ -46,18 +42,13 @@ ${kwList}`;
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    let msg = `HTTP ${response.status}`;
-    try {
-      const err = JSON.parse(errorText);
-      msg = err.error?.message || msg;
-    } catch {}
+    let msg = `Erreur serveur ${response.status}`;
+    try { const err = await response.json(); msg = err.error || msg; } catch {}
     throw new Error(msg);
   }
 
   const data = await response.json();
-
-  if (data.error) throw new Error(data.error.message);
+  if (data.error) throw new Error(data.error);
 
   const rawText = (data.content || [])
     .filter(b => b.type === 'text')
@@ -65,14 +56,13 @@ ${kwList}`;
     .join('')
     .trim();
 
-  // Parse JSON, handle markdown fences
   let parsed;
   try {
     const cleaned = rawText.replace(/^```(?:json)?[\r\n]?|```$/gm, '').trim();
     const arrMatch = cleaned.match(/\[[\s\S]*\]/);
     parsed = JSON.parse(arrMatch ? arrMatch[0] : cleaned);
   } catch {
-    throw new Error(`JSON invalide reçu : ${rawText.substring(0, 150)}`);
+    throw new Error(`JSON invalide : ${rawText.substring(0, 150)}`);
   }
 
   if (!Array.isArray(parsed)) throw new Error('Réponse API non array');
